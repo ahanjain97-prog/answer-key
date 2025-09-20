@@ -1,7 +1,13 @@
+import argparse
+import copy
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 import numpy as np
+import requests
 from math import sqrt, isfinite
-from typing import Dict, List, Optional, Tuple
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -77,6 +83,383 @@ CONFIG = {
     }
 }
 # ====================================================================
+
+BASE_CONFIG = copy.deepcopy(CONFIG)
+
+API_BASE_URL = "https://api.the-odds-api.com/v4"
+
+
+@dataclass
+class SpreadOdds:
+    home_line: Optional[float] = None
+    away_line: Optional[float] = None
+    home_odds: Optional[int] = None
+    away_odds: Optional[int] = None
+
+
+@dataclass
+class TotalOdds:
+    line: Optional[float] = None
+    over_odds: Optional[int] = None
+    under_odds: Optional[int] = None
+
+
+@dataclass
+class MoneylineOdds:
+    home_odds: Optional[int] = None
+    away_odds: Optional[int] = None
+
+
+@dataclass
+class PeriodOdds:
+    spread: SpreadOdds
+    total: TotalOdds
+    moneyline: MoneylineOdds
+
+
+@dataclass
+class BookmakerOdds:
+    key: str
+    title: str
+    last_update: Optional[str]
+    periods: Dict[str, PeriodOdds]
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if s == "":
+            return None
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if s == "":
+            return None
+        return int(round(float(s)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_name(value: Any) -> str:
+    return str(value).strip().lower() if value is not None else ""
+
+
+def _parse_spread_market(market: Optional[Dict[str, Any]], home_team: str, away_team: str) -> SpreadOdds:
+    spread = SpreadOdds()
+    if not market:
+        return spread
+    home_norm = _normalize_name(home_team)
+    away_norm = _normalize_name(away_team)
+    for outcome in market.get("outcomes", []):
+        name_norm = _normalize_name(outcome.get("name"))
+        point = _safe_float(outcome.get("point"))
+        price = _safe_int(outcome.get("price"))
+        if name_norm == home_norm:
+            spread.home_line = point
+            spread.home_odds = price
+        elif name_norm == away_norm:
+            spread.away_line = point
+            spread.away_odds = price
+    return spread
+
+
+def _parse_total_market(market: Optional[Dict[str, Any]]) -> TotalOdds:
+    total = TotalOdds()
+    if not market:
+        return total
+    for outcome in market.get("outcomes", []):
+        name_norm = _normalize_name(outcome.get("name"))
+        point = _safe_float(outcome.get("point"))
+        price = _safe_int(outcome.get("price"))
+        if name_norm == "over":
+            if point is not None:
+                total.line = point
+            total.over_odds = price
+        elif name_norm == "under":
+            if total.line is None and point is not None:
+                total.line = point
+            total.under_odds = price
+    return total
+
+
+def _parse_moneyline_market(market: Optional[Dict[str, Any]], home_team: str, away_team: str) -> MoneylineOdds:
+    moneyline = MoneylineOdds()
+    if not market:
+        return moneyline
+    home_norm = _normalize_name(home_team)
+    away_norm = _normalize_name(away_team)
+    for outcome in market.get("outcomes", []):
+        name_norm = _normalize_name(outcome.get("name"))
+        price = _safe_int(outcome.get("price"))
+        if name_norm == home_norm:
+            moneyline.home_odds = price
+        elif name_norm == away_norm:
+            moneyline.away_odds = price
+    return moneyline
+
+
+def _resolve_home_line(spread: SpreadOdds) -> Optional[float]:
+    if spread.home_line is not None:
+        return spread.home_line
+    if spread.away_line is not None:
+        return -spread.away_line
+    return None
+
+
+def _resolve_away_line(spread: SpreadOdds) -> Optional[float]:
+    if spread.away_line is not None:
+        return spread.away_line
+    if spread.home_line is not None:
+        return -spread.home_line
+    return None
+
+
+def _select_event_from_list(events: List[Dict[str, Any]], home_team: Optional[str], away_team: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not events:
+        return None
+    home_norm = _normalize_name(home_team)
+    away_norm = _normalize_name(away_team)
+    if home_norm or away_norm:
+        matches: List[Dict[str, Any]] = []
+        for event in events:
+            ev_home = _normalize_name(event.get("home_team"))
+            ev_away = _normalize_name(event.get("away_team"))
+            matched = False
+            if home_norm and away_norm:
+                matched = (ev_home == home_norm and ev_away == away_norm)
+                if not matched:
+                    matched = (ev_home == away_norm and ev_away == home_norm)
+            elif home_norm:
+                matched = ev_home == home_norm or ev_away == home_norm
+            elif away_norm:
+                matched = ev_home == away_norm or ev_away == away_norm
+            if matched:
+                matches.append(event)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            matches.sort(key=lambda e: e.get("commence_time") or "")
+            chosen = matches[0]
+            print(
+                f"⚠️ Multiple events matched filters; using {chosen.get('away_team')} at {chosen.get('home_team')}"
+                f" (commence {chosen.get('commence_time')})."
+            )
+            return chosen
+        return matches[0]
+    return events[0]
+
+
+def fetch_event_from_api(
+    api_key: str,
+    sport_key: str,
+    regions: str = "us",
+    event_id: Optional[str] = None,
+    home_team: Optional[str] = None,
+    away_team: Optional[str] = None,
+    bookmakers: Optional[List[str]] = None,
+    markets: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    if not api_key:
+        raise ValueError("An Odds API key is required when --use-api is specified.")
+
+    if markets is None or not markets:
+        markets = [
+            "spreads",
+            "totals",
+            "h2h",
+            "first_half_spreads",
+            "first_half_totals",
+            "first_half_moneyline",
+            "first_quarter_spreads",
+            "first_quarter_totals",
+            "first_quarter_moneyline",
+        ]
+
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "markets": ",".join(markets),
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    if bookmakers:
+        params["bookmakers"] = ",".join(bookmakers)
+
+    if event_id:
+        url = f"{API_BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
+        response = requests.get(url, params=params, timeout=30)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(
+                f"Failed to fetch odds from The Odds API ({exc}). Response: {response.text}"
+            ) from exc
+        remaining = response.headers.get("x-requests-remaining") or response.headers.get("X-Requests-Remaining")
+        if remaining is not None:
+            print(f"🔁 Odds API requests remaining: {remaining}")
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected API response for event odds; expected a JSON object.")
+        return data
+
+    url = f"{API_BASE_URL}/sports/{sport_key}/odds"
+    response = requests.get(url, params=params, timeout=30)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(
+            f"Failed to fetch odds from The Odds API ({exc}). Response: {response.text}"
+        ) from exc
+    remaining = response.headers.get("x-requests-remaining") or response.headers.get("X-Requests-Remaining")
+    if remaining is not None:
+        print(f"🔁 Odds API requests remaining: {remaining}")
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError("Unexpected API response; expected a list of events.")
+
+    event = _select_event_from_list(data, home_team=home_team, away_team=away_team)
+    if event is None:
+        raise ValueError("No event found that matches the provided filters.")
+
+    event_id_selected = event.get("id")
+    if event_id_selected:
+        return fetch_event_from_api(
+            api_key=api_key,
+            sport_key=sport_key,
+            regions=regions,
+            event_id=event_id_selected,
+            bookmakers=bookmakers,
+            markets=markets,
+        )
+    return event
+
+
+def parse_bookmaker_odds(event: Dict[str, Any], include_bookmakers: Optional[List[str]] = None) -> List[BookmakerOdds]:
+    home_team = event.get("home_team")
+    away_team = event.get("away_team")
+    if not home_team or not away_team:
+        raise ValueError("Event data missing home or away team information.")
+
+    include_set = {bk.strip().lower() for bk in include_bookmakers} if include_bookmakers else None
+    bookmakers: List[BookmakerOdds] = []
+
+    for bookmaker in event.get("bookmakers", []):
+        key = bookmaker.get("key")
+        if not key:
+            continue
+        if include_set and key.lower() not in include_set:
+            continue
+
+        markets = {m.get("key"): m for m in bookmaker.get("markets", []) if m.get("key")}
+        periods = {
+            "full": PeriodOdds(
+                spread=_parse_spread_market(markets.get("spreads"), home_team, away_team),
+                total=_parse_total_market(markets.get("totals")),
+                moneyline=_parse_moneyline_market(markets.get("h2h"), home_team, away_team),
+            ),
+            "1H": PeriodOdds(
+                spread=_parse_spread_market(markets.get("first_half_spreads"), home_team, away_team),
+                total=_parse_total_market(markets.get("first_half_totals")),
+                moneyline=_parse_moneyline_market(markets.get("first_half_moneyline"), home_team, away_team),
+            ),
+            "1Q": PeriodOdds(
+                spread=_parse_spread_market(markets.get("first_quarter_spreads"), home_team, away_team),
+                total=_parse_total_market(markets.get("first_quarter_totals")),
+                moneyline=_parse_moneyline_market(markets.get("first_quarter_moneyline"), home_team, away_team),
+            ),
+        }
+
+        bookmakers.append(
+            BookmakerOdds(
+                key=key,
+                title=bookmaker.get("title", key),
+                last_update=bookmaker.get("last_update"),
+                periods=periods,
+            )
+        )
+
+    return bookmakers
+
+
+def apply_book_odds_to_config(config: Dict[str, Any], book: BookmakerOdds) -> None:
+    full = book.periods.get("full")
+    if full:
+        home_line = _resolve_home_line(full.spread)
+        if home_line is not None:
+            config["BOOK"]["full"]["spread"] = float(home_line)
+            config["TARGET"]["spread"] = abs(float(home_line))
+            config["TARGET"]["favorite"] = "home" if home_line < 0 else "away"
+        if full.total.line is not None:
+            config["BOOK"]["full"]["total"] = float(full.total.line)
+            config["TARGET"]["total"] = float(full.total.line)
+
+        fav_side = config["TARGET"].get("favorite", "home")
+        fav_odds = None
+        dog_odds = None
+        if fav_side == "home":
+            fav_odds = full.spread.home_odds
+            dog_odds = full.spread.away_odds
+        else:
+            fav_odds = full.spread.away_odds
+            dog_odds = full.spread.home_odds
+        if fav_odds is not None:
+            config["TARGET"]["parent_spread_odds"]["fav"] = fav_odds
+        if dog_odds is not None:
+            config["TARGET"]["parent_spread_odds"]["dog"] = dog_odds
+        if full.total.over_odds is not None:
+            config["TARGET"]["parent_total_odds"]["over"] = full.total.over_odds
+        if full.total.under_odds is not None:
+            config["TARGET"]["parent_total_odds"]["under"] = full.total.under_odds
+
+    for period_key in ("1H", "1Q"):
+        period = book.periods.get(period_key)
+        if not period:
+            continue
+        home_line = _resolve_home_line(period.spread)
+        if home_line is not None:
+            config["BOOK"][period_key]["spread"] = float(home_line)
+        if period.total.line is not None:
+            config["BOOK"][period_key]["total"] = float(period.total.line)
+
+        ev_section = config["EV"].get(period_key)
+        if ev_section:
+            if period.spread.home_odds is not None:
+                ev_section["spread_odds"]["home"] = period.spread.home_odds
+            if period.spread.away_odds is not None:
+                ev_section["spread_odds"]["away"] = period.spread.away_odds
+            if period.total.over_odds is not None:
+                ev_section["total_odds"]["over"] = period.total.over_odds
+            if period.total.under_odds is not None:
+                ev_section["total_odds"]["under"] = period.total.under_odds
+            if period.moneyline.home_odds is not None:
+                ev_section["ml_home_odds"] = period.moneyline.home_odds
+            if period.moneyline.away_odds is not None:
+                ev_section["ml_away_odds"] = period.moneyline.away_odds
+
+
+def build_config_for_book(
+    base_config: Dict[str, Any],
+    book: BookmakerOdds,
+    data_path: str,
+    sheet_name: str,
+    sample_size: int,
+) -> Dict[str, Any]:
+    config = copy.deepcopy(base_config)
+    config["DATA_PATH"] = data_path
+    config["SHEET_NAME"] = sheet_name
+    config["SAMPLE_SIZE"] = sample_size
+    apply_book_odds_to_config(config, book)
+    return config
+
 
 EPS = 1e-9
 
@@ -1053,6 +1436,8 @@ class AnswerKeyAlgorithm:
         ev_1h_ml_away_odds: Optional[float] = None,
         ev_1q_ml_home_odds: Optional[float] = None,
         ev_1q_ml_away_odds: Optional[float] = None,
+        output_prefix: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         print("\n" + "="*76)
         print("🚀 Starting Answer Key Analysis 🚀".center(76))
@@ -1065,8 +1450,13 @@ class AnswerKeyAlgorithm:
         N = sample_size if sample_size % 2 == 0 else sample_size - 1
         adj_s, adj_t, included, excluded = self._align_means(N, target_spread, target_total)
 
+        file_prefix = output_prefix or ""
+        if file_prefix and not file_prefix.endswith("_"):
+            file_prefix = f"{file_prefix}_"
+
         # Save initial sample snapshot for provenance + push snapshot
-        pd.DataFrame(included).to_csv("initial_sample_topN.csv", index=False)
+        initial_sample_path = f"{file_prefix}initial_sample_topN.csv"
+        pd.DataFrame(included).to_csv(initial_sample_path, index=False)
         self._print_initial_push_snapshot(included)
 
         # Step 3: EXACT median-result balancing on decisive-only counts (push-aware)
@@ -1074,8 +1464,9 @@ class AnswerKeyAlgorithm:
 
         # Final sample
         final_sample = included
-        pd.DataFrame(final_sample).to_csv("final_sample.csv", index=False)
-        print("\n✓ Final sample (pushes allowed) saved to 'final_sample.csv'")
+        final_sample_path = f"{file_prefix}final_sample.csv"
+        pd.DataFrame(final_sample).to_csv(final_sample_path, index=False)
+        print(f"\n✓ Final sample (pushes allowed) saved to '{final_sample_path}'")
 
         # Derivatives
         derivatives = self._calculate_derivatives(final_sample)
@@ -1181,37 +1572,51 @@ class AnswerKeyAlgorithm:
             margins=q1_margins
         )
 
-        pd.DataFrame([{
+        book_line_row = {
             'book_spread_full': book_spread_full,
             'book_total_full':  book_total_full,
             'book_spread_1h':   book_spread_1h,
             'book_total_1h':    book_total_1h,
             'book_spread_1q':   book_spread_1q,
             'book_total_1q':    book_total_1q
-        }]).to_csv("book_lines_used.csv", index=False)
+        }
+        if metadata:
+            book_line_row.update(metadata)
+        book_lines_path = f"{file_prefix}book_lines_used.csv"
+        pd.DataFrame([book_line_row]).to_csv(book_lines_path, index=False)
 
 
-def main():
-    # Resolve parent target spread sign from CONFIG
+def run_analysis_for_config(
+    config: Dict[str, Any],
+    output_prefix: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    label: Optional[str] = None,
+) -> None:
+    global CONFIG
+    CONFIG = config
+
+    if label:
+        print("\n" + "=" * 76)
+        print(f"Using odds source: {label}".center(76))
+        print("=" * 76)
+
     t_spread = float(CONFIG["TARGET"]["spread"])
-    t_total  = float(CONFIG["TARGET"]["total"])
+    t_total = float(CONFIG["TARGET"]["total"])
     fav_side = str(CONFIG["TARGET"]["favorite"]).strip().lower()
     if fav_side not in ("home", "away"):
         raise ValueError("CONFIG.TARGET.favorite must be 'home' or 'away'")
     target_spread = -abs(t_spread) if fav_side == "home" else abs(t_spread)
 
-    # Resolve BOOK lines
     B = CONFIG["BOOK"]
     full_spread = B["full"]["spread"] if B["full"]["spread"] is not None else target_spread
-    full_total  = B["full"]["total"]  if B["full"]["total"]  is not None else t_total
+    full_total = B["full"]["total"] if B["full"]["total"] is not None else t_total
 
     h1_spread = B["1H"]["spread"] if B["1H"]["spread"] is not None else (full_spread / 2.0)
-    h1_total  = B["1H"]["total"]  if B["1H"]["total"]  is not None else (full_total  / 2.0)
+    h1_total = B["1H"]["total"] if B["1H"]["total"] is not None else (full_total / 2.0)
 
     q1_spread = B["1Q"]["spread"] if B["1Q"]["spread"] is not None else (full_spread / 4.0)
-    q1_total  = B["1Q"]["total"]  if B["1Q"]["total"]  is not None else (full_total  / 4.0)
+    q1_total = B["1Q"]["total"] if B["1Q"]["total"] is not None else (full_total / 4.0)
 
-    # Team totals (defaults if None) using BOOK lines
     TT = CONFIG["TEAM_TOTALS"]
     if TT["full"]["home"] is None or TT["full"]["away"] is None:
         home_tt = (full_total - full_spread) / 2.0
@@ -1227,31 +1632,29 @@ def main():
         home_tt_1h = float(TT["1H"]["home"])
         away_tt_1h = float(TT["1H"]["away"])
 
-    # EV odds (side-specific)
     EV = CONFIG["EV"]
     ev_1h_spread_odds_home = EV["1H"]["spread_odds"]["home"]
     ev_1h_spread_odds_away = EV["1H"]["spread_odds"]["away"]
-    ev_1h_total_odds_over  = EV["1H"]["total_odds"]["over"]
+    ev_1h_total_odds_over = EV["1H"]["total_odds"]["over"]
     ev_1h_total_odds_under = EV["1H"]["total_odds"]["under"]
     ev_1q_spread_odds_home = EV["1Q"]["spread_odds"]["home"]
     ev_1q_spread_odds_away = EV["1Q"]["spread_odds"]["away"]
-    ev_1q_total_odds_over  = EV["1Q"]["total_odds"]["over"]
+    ev_1q_total_odds_over = EV["1Q"]["total_odds"]["over"]
     ev_1q_total_odds_under = EV["1Q"]["total_odds"]["under"]
-    ev_1h_ml_home_odds     = EV["1H"]["ml_home_odds"]
-    ev_1h_ml_away_odds     = EV["1H"]["ml_away_odds"]
-    ev_1q_ml_home_odds     = EV["1Q"]["ml_home_odds"]
-    ev_1q_ml_away_odds     = EV["1Q"]["ml_away_odds"]
+    ev_1h_ml_home_odds = EV["1H"]["ml_home_odds"]
+    ev_1h_ml_away_odds = EV["1H"]["ml_away_odds"]
+    ev_1q_ml_home_odds = EV["1Q"]["ml_home_odds"]
+    ev_1q_ml_away_odds = EV["1Q"]["ml_away_odds"]
 
-    # Enforce even N
-    N = int(CONFIG["SAMPLE_SIZE"])
-    if N % 2 == 1:
-        N -= 1
+    sample_size = int(CONFIG["SAMPLE_SIZE"])
+    if sample_size % 2 == 1:
+        sample_size -= 1
 
     algo = AnswerKeyAlgorithm(CONFIG["DATA_PATH"])
     algo.run_analysis(
         target_spread=target_spread,
         target_total=t_total,
-        sample_size=N,
+        sample_size=sample_size,
         book_spread_full=full_spread,
         book_total_full=full_total,
         book_spread_1h=h1_spread,
@@ -1272,7 +1675,106 @@ def main():
         ev_1h_ml_away_odds=ev_1h_ml_away_odds,
         ev_1q_ml_home_odds=ev_1q_ml_home_odds,
         ev_1q_ml_away_odds=ev_1q_ml_away_odds,
+        output_prefix=output_prefix,
+        metadata=metadata,
     )
+
+
+def _split_csv_list(value: Optional[str]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    parts = [item.strip() for item in value.split(",") if item.strip()]
+    return parts or None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Answer Key analysis for NCAAF data with optional The Odds API automation."
+    )
+    parser.add_argument("--data-path", default=CONFIG["DATA_PATH"], help="Path to the historical dataset (CSV or Excel).")
+    parser.add_argument("--sheet-name", default=CONFIG["SHEET_NAME"], help="Sheet name when loading Excel data.")
+    parser.add_argument("--sample-size", type=int, default=CONFIG["SAMPLE_SIZE"], help="Target sample size (must be even).")
+    parser.add_argument("--use-api", action="store_true", help="Fetch current odds from The Odds API instead of using manual config lines.")
+    parser.add_argument("--api-key", default=os.environ.get("ODDS_API_KEY"), help="The Odds API key (or set ODDS_API_KEY env var).")
+    parser.add_argument("--event-id", help="Specific Odds API event ID to fetch.")
+    parser.add_argument("--home-team", help="Home team name to match when searching for events.")
+    parser.add_argument("--away-team", help="Away team name to match when searching for events.")
+    parser.add_argument("--sport-key", default="americanfootball_ncaaf", help="Odds API sport key (default americanfootball_ncaaf).")
+    parser.add_argument("--regions", default="us", help="Comma-separated Odds API regions (default: us).")
+    parser.add_argument("--bookmakers", help="Comma-separated Odds API bookmaker keys to include (default: all).")
+    parser.add_argument("--markets", help="Override the list of Odds API markets to request (comma-separated).")
+    parser.add_argument("--output-prefix", help="Prefix for generated CSV output files (per bookmaker when using API).")
+    return parser.parse_args()
+
+
+def run_manual(args: argparse.Namespace) -> None:
+    config = copy.deepcopy(BASE_CONFIG)
+    config["DATA_PATH"] = args.data_path
+    config["SHEET_NAME"] = args.sheet_name
+    config["SAMPLE_SIZE"] = args.sample_size
+    prefix = args.output_prefix or ""
+    metadata = {"bookmaker_key": "manual", "bookmaker_title": "Manual configuration"}
+    run_analysis_for_config(config, output_prefix=prefix, metadata=metadata, label="Manual configuration")
+
+
+def run_with_api(args: argparse.Namespace) -> None:
+    if not args.api_key:
+        raise ValueError("--use-api requires a valid Odds API key (or set ODDS_API_KEY env var).")
+
+    bookmakers = _split_csv_list(args.bookmakers)
+    markets = _split_csv_list(args.markets)
+
+    event = fetch_event_from_api(
+        api_key=args.api_key,
+        sport_key=args.sport_key,
+        regions=args.regions,
+        event_id=args.event_id,
+        home_team=args.home_team,
+        away_team=args.away_team,
+        bookmakers=bookmakers,
+        markets=markets,
+    )
+
+    event_desc = f"{event.get('away_team')} at {event.get('home_team')}" if isinstance(event, dict) else "Selected event"
+    print(f"📅 Event: {event_desc}")
+    commence_time = event.get("commence_time") if isinstance(event, dict) else None
+    if commence_time:
+        print(f"   Commence time: {commence_time}")
+
+    bookmaker_data = parse_bookmaker_odds(event, include_bookmakers=bookmakers)
+    if not bookmaker_data:
+        raise RuntimeError("No bookmaker odds returned for the requested event and markets.")
+
+    print(f"📚 Retrieved odds for {len(bookmaker_data)} bookmaker(s).")
+
+    base_prefix = (args.output_prefix or "").strip()
+    for book in sorted(bookmaker_data, key=lambda b: b.key):
+        config = build_config_for_book(BASE_CONFIG, book, args.data_path, args.sheet_name, args.sample_size)
+        prefix_parts = [part for part in [base_prefix, book.key] if part]
+        prefix = "_".join(prefix_parts)
+        metadata = {
+            "bookmaker_key": book.key,
+            "bookmaker_title": book.title,
+            "bookmaker_last_update": book.last_update,
+            "event_id": event.get("id"),
+            "event_commence_time": event.get("commence_time"),
+            "event_home_team": event.get("home_team"),
+            "event_away_team": event.get("away_team"),
+        }
+        label = f"{book.title} ({book.key})"
+        run_analysis_for_config(config, output_prefix=prefix, metadata=metadata, label=label)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.sample_size % 2 == 1:
+        print("⚠️ Sample size must be even. Reducing by 1 to maintain parity.")
+        args.sample_size -= 1
+
+    if args.use_api:
+        run_with_api(args)
+    else:
+        run_manual(args)
 
 
 if __name__ == "__main__":
