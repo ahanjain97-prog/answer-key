@@ -1,0 +1,1279 @@
+import pandas as pd
+import numpy as np
+from math import sqrt, isfinite
+from typing import Dict, List, Optional, Tuple
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ========================= ONE PLACE TO EDIT =========================
+CONFIG = {
+    # Use your CSV (wide or legacy) or an Excel file. The loader auto-detects shape.
+    "DATA_PATH": "CFB Final2.csv",  # <-- your CSV path
+    "SHEET_NAME": "Sheet1",                            # ignored for CSV; used only for Excel
+
+    # Parent (target) line used for indexing/balancing (NOT necessarily the book line)
+    # 'favorite' sets home-perspective sign: home favorite => negative, away favorite => positive
+    "TARGET": {
+        "spread": 6.5,
+        "total": 50,
+        "favorite": "away",  # "home" or "away"
+        # Optional juice on parent spread/total to set decisive target rates (ex-push)
+        # If both sides provided, decisive target rates use the no-vig probabilities
+        "parent_spread_odds": {"fav": None, "dog": None},  # None => 50/50
+        "parent_total_odds":  {"over": None, "under": None}  # None => 50/50
+    },
+
+    # Book lines used for correlated parlays & team totals & EV prints
+    "BOOK": {
+        "full": {"spread": 6.5, "total": 50},
+        "1H":   {"spread": 3.5, "total": 24},
+        "1Q":   {"spread": 0.5, "total": 10.5},
+    },
+
+    # Optional explicit team totals (full & 1H). Leave None to decompose from BOOK lines.
+    "TEAM_TOTALS": {
+        "full": {"home": None, "away": None},
+        "1H":   {"home": None, "away": None},
+    },
+
+    # EV odds (American) for 1H & 1Q (side-specific juice)
+    "EV": {
+        "1H": {
+            "spread_odds": {"home": -113, "away": -103},
+            "total_odds":  {"over": -108, "under": -108},
+            "ml_home_odds": 155,
+            "ml_away_odds": -195,
+        },
+        "1Q": {
+            "spread_odds": {"home": -108, "away": -125},
+            "total_odds":  {"over": -105, "under": -125},
+            "ml_home_odds": 130,
+            "ml_away_odds": -160,
+        },
+    },
+
+    # Target sample size (must be EVEN; code enforces exact N at all times)
+    "SAMPLE_SIZE": 400,
+
+    # Mean alignment tolerances
+    "MEAN_TOL": {
+        "spread_abs": 0.10,   # acceptable |mean_spread - target_spread|
+        "total_abs":  0.10,
+        "max_iters":  10
+    },
+
+    # Median balancing tolerances (in games). ZERO forces exact.
+    "MEDIAN_TOL": {
+        "spread_games": 0,      # exact target covers among *decisive* spread games
+        "total_games":  0,      # exact target overs among *decisive* total games
+        "max_passes":   10000
+    },
+
+    # Pairing sanity bands (football)
+    "SANITY": {
+        "total_min": 25.0, "total_max": 90.0,
+        "spread_min": 0.0,  "spread_max": 50.0
+    }
+}
+# ====================================================================
+
+EPS = 1e-9
+
+
+def _to_float_or_nan_close(x):
+    if x is None:
+        return np.nan
+    s = str(x).strip()
+    if s == "" or s.lower() == "nl":
+        return np.nan
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return np.nan
+
+
+def _to_float_score(x):
+    try:
+        return float(str(x).strip())
+    except (ValueError, TypeError):
+        return np.nan
+
+
+def _american_to_decimal(odds: Optional[float]) -> Optional[float]:
+    if odds is None or not isfinite(odds) or odds == 0:
+        return None
+    return 1.0 + (odds / 100.0 if odds > 0 else 100.0 / abs(odds))
+
+
+def _no_vig_prob_from_two_american(a_side: Optional[float], b_side: Optional[float]) -> Optional[float]:
+    da = _american_to_decimal(a_side)
+    db = _american_to_decimal(b_side)
+    if da is None or db is None:
+        return None
+    imp_a = 1.0 / da
+    imp_b = 1.0 / db
+    s = imp_a + imp_b
+    if s <= 0:
+        return None
+    return imp_a / s
+
+
+def _prob_to_american(p: float) -> Optional[int]:
+    if not isfinite(p) or p <= 0.0 or p >= 1.0:
+        return None
+    if p >= 0.5:
+        return int(round(-100 * p / (1.0 - p)))
+    else:
+        return int(round(100 * (1.0 - p) / p))
+
+
+def _ev_from_probs_and_odds(p_win: float, p_loss: float, p_push: float, american_odds: float) -> Optional[float]:
+    """
+    EV per 1u stake with push=void:
+      EV = p_win*(decimal-1) - p_loss*1
+      (p_push neither wins nor loses)
+    """
+    dec = _american_to_decimal(american_odds)
+    if dec is None:
+        return None
+    return p_win * (dec - 1.0) - p_loss * 1.0
+
+
+def _grade_spread_home_perspective(margin: float, home_spread: float) -> str:
+    diff = margin + home_spread
+    if abs(diff) <= EPS:
+        return 'push'
+    return 'win' if diff > 0 else 'loss'
+
+
+def _grade_total_value(actual_value: float, line: float) -> str:
+    diff = actual_value - line
+    if abs(diff) <= EPS:
+        return 'push'
+    return 'over' if diff > 0 else 'under'
+
+
+def _parlay_grade(leg1: str, leg2: str) -> str:
+    if leg1 == 'loss' or leg2 == 'loss':
+        return 'loss'
+    if leg1 == 'push' or leg2 == 'push':
+        return 'push'
+    return 'win'
+
+
+def safe_sum_or_nan(*vals) -> float:
+    for v in vals:
+        if not isfinite(v):
+            return np.nan
+    return float(sum(vals))
+
+
+# ========================= Uniqueness helpers =========================
+def _teams_and_score_key(g: Dict) -> tuple:
+    """Stricter uniqueness by teams and final score, ignoring ID."""
+    vt = str(g.get('visitor_team', '')).strip().lower()
+    ht = str(g.get('home_team', '')).strip().lower()
+    vs = g.get('visitor_score')
+    hs = g.get('home_score')
+    vs_key = int(round(vs)) if pd.notna(vs) and isfinite(vs) else -9999
+    hs_key = int(round(hs)) if pd.notna(hs) and isfinite(hs) else -9999
+    return (vt, ht, vs_key, hs_key)
+# ====================================================================
+
+
+class AnswerKeyAlgorithm:
+    """
+    Answer Key with HARD uniqueness by teams & score, and *push-aware* balancing:
+      1) index by distance (spread/total)
+      2) build initial top-N UNIQUE-by-TEAM/SCORE sample (pushes allowed)
+      3) iterate target to align means
+      4) exact median-result balancing on decisive-only counts (pushes ignored for the target),
+         via atomic remove+add, keeping N EXACT and never duplicating games.
+    """
+
+    def __init__(self, data_source: str):
+        print(f"⌛ Loading data from '{data_source}'...")
+        try:
+            if str(data_source).lower().endswith((".xlsx", ".xls")):
+                sheet = CONFIG.get("SHEET_NAME", 0)
+                self.df = pd.read_excel(data_source, sheet_name=sheet, dtype=str)
+            else:
+                self.df = pd.read_csv(data_source, dtype=str)
+        except FileNotFoundError:
+            print(f"❌ ERROR: Data file not found at '{data_source}'")
+            raise
+
+        self.games_all = self._process_raw_data()
+        if not self.games_all:
+            print("❌ ERROR: No valid game data could be processed.")
+            raise ValueError("Data processing failed.")
+
+        self.sorted_games: List[Dict] = []
+        self.target_spread = None
+        self.target_total = None
+
+    # ---------- pairing helpers for legacy CSV ----------
+    def _iter_pairs_with_id(self, rows: pd.DataFrame):
+        i = 0
+        matched = mismatched = 0
+        while i + 1 < len(rows):
+            id_i = str(rows.iloc[i].get('ID', '')).strip()
+            id_j = str(rows.iloc[i + 1].get('ID', '')).strip()
+            if id_i != "" and id_i == id_j:
+                matched += 1
+                yield rows.iloc[i], rows.iloc[i + 1]
+                i += 2
+            else:
+                mismatched += 1
+                i += 1
+        if matched or mismatched:
+            print(f"   ID pairing: matched {matched} pairs; skipped {mismatched} rows for ID mismatch/resync.")
+
+    def _iter_pairs_no_id(self, rows: pd.DataFrame):
+        usable_len = len(rows) - (len(rows) % 2)
+        for i in range(0, usable_len, 2):
+            yield rows.iloc[i], rows.iloc[i + 1]
+
+    def _process_raw_data(self) -> List[Dict]:
+        print("🧹 Processing and cleaning data...")
+        self.df.columns = [c.strip() for c in self.df.columns]
+        df = self.df.copy()
+
+        # Detect wide (one-row-per-game) shape (works for CSV or Excel)
+        cols_lower = {c.lower(): c for c in df.columns}
+        have_wide = all(k in cols_lower for k in
+                        ["vha", "vhb", "teama", "teamb", "finala", "finalb", "closea", "closeb"])
+
+        # =================== WIDE PATH (one row per game) ===================
+        if have_wide:
+            def qval(row, key):
+                return _to_float_score(row.get(cols_lower.get(key, ""), np.nan))
+
+            games = []
+            sanity_skipped = 0
+
+            total_min = float(CONFIG["SANITY"]["total_min"])
+            total_max = float(CONFIG["SANITY"]["total_max"])
+            spread_min = float(CONFIG["SANITY"]["spread_min"])
+            spread_max = float(CONFIG["SANITY"]["spread_max"])
+
+            for _, r in df.iterrows():
+                v_team = str(r[cols_lower["teama"]]).strip()
+                h_team = str(r[cols_lower["teamb"]]).strip()
+
+                v_close = _to_float_or_nan_close(r[cols_lower["closea"]])
+                h_close = _to_float_or_nan_close(r[cols_lower["closeb"]])
+                if not (isfinite(v_close) and isfinite(h_close)):
+                    continue
+
+                # SAME "CLOSE" RULES:
+                # total = max(Closea, Closeb); spread_mag = min(Closea, Closeb)
+                # spread sign by which side holds the min (visitor => +, home => -)
+                if v_close < h_close - EPS:
+                    total, spread_mag, fav_side = h_close, v_close, 'visitor'
+                elif h_close < v_close - EPS:
+                    total, spread_mag, fav_side = v_close, h_close, 'home'
+                else:
+                    total = max(v_close, h_close)
+                    spread_mag = min(v_close, h_close)
+                    fav_side = 'visitor' if v_close <= h_close else 'home'
+
+                if not (total_min - 1e-6 <= total <= total_max + 1e-6 and
+                        spread_min - 1e-6 <= spread_mag <= spread_max + 1e-6):
+                    sanity_skipped += 1
+                    continue
+
+                spread = spread_mag if fav_side == 'visitor' else -spread_mag
+
+                v_final = _to_float_score(r.get(cols_lower.get("finala", ""), np.nan))
+                h_final = _to_float_score(r.get(cols_lower.get("finalb", ""), np.nan))
+
+                v_q1 = qval(r, "1sta"); v_q2 = qval(r, "2nda"); v_q3 = qval(r, "3rda"); v_q4 = qval(r, "4tha")
+                h_q1 = qval(r, "1stb"); h_q2 = qval(r, "2ndb"); h_q3 = qval(r, "3rdb"); h_q4 = qval(r, "4thb")
+
+                game_date = str(r.get(cols_lower.get("datea", ""), "")).strip()
+                game = {
+                    'visitor_team': v_team, 'home_team': h_team,
+                    'visitor_score': v_final, 'home_score': h_final,
+                    'visitor_q1': v_q1, 'home_q1': h_q1,
+                    'visitor_q2': v_q2, 'home_q2': h_q2,
+                    'visitor_q3': v_q3, 'home_q3': h_q3,
+                    'visitor_q4': v_q4, 'home_q4': h_q4,
+                    'spread': float(spread), 'total': float(total),
+                    'uid': "", 'date': game_date,
+                    'included': False, 'origin': None, 'distance': float('inf'), 'rank': None
+                }
+
+                if isfinite(h_final) and isfinite(v_final):
+                    game['final_margin'] = h_final - v_final
+                    game['final_total']  = h_final + v_final
+                else:
+                    game['final_margin'] = np.nan
+                    game['final_total']  = np.nan
+
+                home_h1 = safe_sum_or_nan(h_q1, h_q2)
+                away_h1 = safe_sum_or_nan(v_q1, v_q2)
+                if isfinite(home_h1) and isfinite(away_h1):
+                    game['h1_margin'] = home_h1 - away_h1
+                    game['h1_total']  = home_h1 + away_h1
+                else:
+                    game['h1_margin'] = np.nan
+                    game['h1_total']  = np.nan
+
+                if isfinite(h_q1) and isfinite(v_q1):
+                    game['q1_margin'] = h_q1 - v_q1
+                    game['q1_total']  = h_q1 + v_q1
+                else:
+                    game['q1_margin'] = np.nan
+                    game['q1_total']  = np.nan
+
+                games.append(game)
+
+            # de-dup (teams & score)
+            unique_games, seen = [], set()
+            for g in games:
+                if not (isfinite(g.get('visitor_score')) and isfinite(g.get('home_score'))):
+                    continue
+                k = _teams_and_score_key(g)
+                if k not in seen:
+                    seen.add(k)
+                    unique_games.append(g)
+
+            print(f"✓ Found and processed {len(unique_games)} unique games (wide format, by team & score).")
+            if sanity_skipped:
+                print(f"   Sanity-skipped rows (outside plausible total/spread bands): {sanity_skipped}")
+            return unique_games
+
+        # =================== LEGACY CSV PATH (two rows per game) ===================
+        if 'VH' not in df.columns:
+            raise ValueError("Expected a 'VH' column (values like V/H/N) for legacy CSV format.")
+
+        df['VH']  = df['VH'].astype(str).str.strip().str.upper()
+        if 'ID' in df.columns:
+            df['ID'] = df['ID'].astype(str).str.strip()
+        if 'Date' in df.columns:
+            df['Date'] = df['Date'].astype(str).str.strip()
+
+        initial_rows = len(df)
+        for col in ['Team', 'Close', 'Final']:
+            if col not in df.columns:
+                raise ValueError(f"Missing required column: '{col}'")
+
+        rows = df.reset_index(drop=True)
+        pair_iter = self._iter_pairs_with_id(rows) if 'ID' in rows.columns else self._iter_pairs_no_id(rows)
+
+        games = []
+        dropped_for_close = 0
+        neutral_pairs = 0
+        vh_pairs = 0
+        odd_vh_resolved = 0
+        sanity_skipped = 0
+
+        total_min = float(CONFIG["SANITY"]["total_min"])
+        total_max = float(CONFIG["SANITY"]["total_max"])
+        spread_min = float(CONFIG["SANITY"]["spread_min"])
+        spread_max = float(CONFIG["SANITY"]["spread_max"])
+
+        def qval(r, key):
+            return _to_float_score(r.get(key))
+
+        for r_a, r_b in pair_iter:
+            a_close = _to_float_or_nan_close(r_a['Close'])
+            b_close = _to_float_or_nan_close(r_b['Close'])
+            if not (isfinite(a_close) and isfinite(b_close)):
+                dropped_for_close += 1
+                continue
+
+            a_vh, b_vh = str(r_a['VH']), str(r_b['VH'])
+            if {a_vh, b_vh} == {'V', 'H'}:
+                vh_pairs += 1
+                v, h = (r_a, r_b) if a_vh == 'V' else (r_b, r_a)
+            elif a_vh == 'N' and b_vh == 'N':
+                neutral_pairs += 1
+                v, h = r_a, r_b
+            else:
+                odd_vh_resolved += 1
+                v, h = r_a, r_b
+
+            v_close_val = _to_float_or_nan_close(v['Close'])
+            h_close_val = _to_float_or_nan_close(h['Close'])
+            if not (isfinite(v_close_val) and isfinite(h_close_val)):
+                dropped_for_close += 1
+                continue
+
+            cand_total = max(v_close_val, h_close_val)
+            cand_spread_mag = min(v_close_val, h_close_val)
+
+            if not (total_min - 1e-6 <= cand_total <= total_max + 1e-6 and
+                    spread_min - 1e-6 <= cand_spread_mag <= spread_max + 1e-6):
+                sanity_skipped += 1
+                continue
+
+            if v_close_val < h_close_val - EPS:
+                total, spread_mag, fav_side = h_close_val, v_close_val, 'visitor'
+            elif h_close_val < v_close_val - EPS:
+                total, spread_mag, fav_side = v_close_val, h_close_val, 'home'
+            else:
+                total = cand_total
+                spread_mag = cand_spread_mag
+                fav_side = 'visitor' if v_close_val <= h_close_val else 'home'
+
+            spread = spread_mag if fav_side == 'visitor' else -spread_mag
+
+            v_final, h_final = _to_float_score(v['Final']), _to_float_score(h['Final'])
+
+            v_q1, v_q2, v_q3, v_q4 = qval(v, '1st'), qval(v, '2nd'), qval(v, '3rd'), qval(v, '4th')
+            h_q1, h_q2, h_q3, h_q4 = qval(h, '1st'), qval(h, '2nd'), qval(h, '3rd'), qval(h, '4th')
+
+            game_id  = (str(v.get('ID', '')).strip() or str(h.get('ID', '')).strip()) or ""
+            game_date = (str(v.get('Date', '')).strip() or str(h.get('Date', '')).strip()) or ""
+
+            game = {
+                'visitor_team': str(v['Team']).strip(), 'home_team': str(h['Team']).strip(),
+                'visitor_score': v_final, 'home_score': h_final,
+                'visitor_q1': v_q1, 'home_q1': h_q1,
+                'visitor_q2': v_q2, 'home_q2': h_q2,
+                'visitor_q3': v_q3, 'home_q3': h_q3,
+                'visitor_q4': v_q4, 'home_q4': h_q4,
+                'spread': float(spread), 'total': float(total),
+                'uid': game_id, 'date': game_date,
+                'included': False, 'origin': None, 'distance': float('inf'), 'rank': None
+            }
+
+            if isfinite(h_final) and isfinite(v_final):
+                game['final_margin'] = h_final - v_final
+                game['final_total'] = h_final + v_final
+            else:
+                game['final_margin'], game['final_total'] = np.nan, np.nan
+
+            home_h1 = safe_sum_or_nan(h_q1, h_q2)
+            away_h1 = safe_sum_or_nan(v_q1, v_q2)
+            if isfinite(home_h1) and isfinite(away_h1):
+                game['h1_margin'] = home_h1 - away_h1
+                game['h1_total']  = home_h1 + away_h1
+            else:
+                game['h1_margin'] = np.nan
+                game['h1_total']  = np.nan
+
+            if isfinite(h_q1) and isfinite(v_q1):
+                game['q1_margin'] = h_q1 - v_q1
+                game['q1_total']  = h_q1 + v_q1
+            else:
+                game['q1_margin'] = np.nan
+                game['q1_total']  = np.nan
+
+            games.append(game)
+
+        # --- de-dup (teams & score) ---------------------------------------
+        unique_games, seen = [], set()
+        for g in games:
+            if not (isfinite(g.get('visitor_score')) and isfinite(g.get('home_score'))):
+                continue
+            k = _teams_and_score_key(g)
+            if k not in seen:
+                seen.add(k)
+                unique_games.append(g)
+        # ----------------------------------------------------------------------
+
+        print(f"✓ Found and processed {len(unique_games)} unique games (by team & score).")
+        print(f"   Total raw rows: {initial_rows}")
+        print(f"   Neutral-site pairs handled: {neutral_pairs}")
+        print(f"   Clean V/H pairs: {vh_pairs}")
+        print(f"   Odd/ambiguous VH resolved: {odd_vh_resolved}")
+        print(f"   Dropped pairs for NL/missing Close: {dropped_for_close}")
+        if sanity_skipped:
+            print(f"   Sanity-skipped pairs (outside plausible total/spread bands): {sanity_skipped}")
+        return unique_games
+
+    # ---------- indexing ----------
+    def _calculate_distance(self, game, target_spread, target_total):
+        return sqrt((game['spread'] - target_spread) ** 2 + (game['total'] - target_total) ** 2)
+
+    def _index_and_sort(self, target_spread, target_total):
+        for g in self.games_all:
+            g['distance'] = self._calculate_distance(g, target_spread, target_total)
+        self.sorted_games = sorted(self.games_all, key=lambda x: x['distance'])
+        for i, g in enumerate(self.sorted_games, start=1):
+            g['rank'] = i
+
+    # ---------- outcome helpers ----------
+    def _cover_bool(self, g) -> bool:
+        return (g['final_margin'] > -self.target_spread)
+
+    def _spread_push_bool(self, g) -> bool:
+        return abs(g['final_margin'] + self.target_spread) <= EPS
+
+    def _over_bool(self, g) -> bool:
+        return (g['final_total'] > self.target_total)
+
+    def _total_push_bool(self, g) -> bool:
+        return abs(g['final_total'] - self.target_total) <= EPS
+
+    # ---------- sample builders (UNIQUE by team/score, pushes allowed) ----------
+    def _build_topN_unique(self, N: int) -> Tuple[List[Dict], List[Dict]]:
+        included, excluded = [], []
+        used_game_keys = set()
+        count = 0
+
+        for g in self.sorted_games:
+            g['included'] = False
+            g['origin'] = None
+
+        for g in self.sorted_games:
+            # need valid final numbers
+            if not (isfinite(g.get('final_margin')) and isfinite(g.get('final_total'))):
+                excluded.append(g)
+                continue
+
+            key = _teams_and_score_key(g)
+            if key in used_game_keys:
+                excluded.append(g)
+                continue
+
+            if count < N:
+                used_game_keys.add(key)
+                g['included'] = True
+                g['origin'] = 'original'
+                included.append(g)
+                count += 1
+            else:
+                excluded.append(g)
+
+        if count < N:
+            raise ValueError(f"Only {count} eligible UNIQUE games; cannot build sample of {N}.")
+        return included, excluded
+
+    def _sample_means(self, sample: List[Dict]) -> Tuple[float, float]:
+        return (np.mean([g['spread'] for g in sample]),
+                np.mean([g['total']  for g in sample]))
+
+    # ---------- Answer Key Step 2: mean alignment loop ----------
+    def _align_means(self, N: int, target_spread: float, target_total: float) -> Tuple[float, float, List[Dict], List[Dict]]:
+        tol_s = CONFIG["MEAN_TOL"]["spread_abs"]
+        tol_t = CONFIG["MEAN_TOL"]["total_abs"]
+        max_iters = CONFIG["MEAN_TOL"]["max_iters"]
+
+        adj_s, adj_t = target_spread, target_total
+        for i in range(max_iters):
+            self._index_and_sort(adj_s, adj_t)
+            inc, exc = self._build_topN_unique(N)
+            m_s, m_t = self._sample_means(inc)
+            err_s = m_s - target_spread
+            err_t = m_t - target_total
+            if abs(err_s) <= tol_s and abs(err_t) <= tol_t:
+                print(f"✓ Mean aligned after {i+1} iterations. Adjusted Target used for indexing: Spd={adj_s:.2f}, Tot={adj_t:.2f}")
+                return adj_s, adj_t, inc, exc
+            adj_s -= err_s
+            adj_t -= err_t
+        print(f"⚠️  Mean alignment hit max iters. Using best effort. Adjusted: Spd={adj_s:.2f}, Tot={adj_t:.2f}")
+        self._index_and_sort(adj_s, adj_t)
+        inc, exc = self._build_topN_unique(N)
+        return adj_s, adj_t, inc, exc
+
+    # ---------- desired decisive rates from parent juice ----------
+    def _desired_decisive_probs(self) -> Tuple[float, float]:
+        po = CONFIG["TARGET"]["parent_spread_odds"]
+        if po and (po.get("fav") is not None) and (po.get("dog") is not None):
+            p_fav = _no_vig_prob_from_two_american(po["fav"], po["dog"])
+            p_cover = float(p_fav) if p_fav is not None else 0.5
+        else:
+            p_cover = 0.5
+
+        to = CONFIG["TARGET"]["parent_total_odds"]
+        if to and (to.get("over") is not None) and (to.get("under") is not None):
+            p_over = _no_vig_prob_from_two_american(to["over"], to["under"])
+            p_over = float(p_over) if p_over is not None else 0.5
+        else:
+            p_over = 0.5
+
+        return p_cover, p_over
+
+    # ---------- push-aware EXACT median balancing ----------
+    def _balance_medians_exact(self, included: List[Dict], excluded: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        p_cover_target, p_over_target = self._desired_decisive_probs()
+        tol_cover = CONFIG["MEDIAN_TOL"]["spread_games"]
+        tol_over  = CONFIG["MEDIAN_TOL"]["total_games"]
+        max_pass  = CONFIG["MEDIAN_TOL"]["max_passes"]
+
+        original_in_ids = set(id(g) for g in included)
+        original_ex_ids = set(id(g) for g in excluded)
+
+        def counts(sample):
+            c = sum(1 for g in sample if self._cover_bool(g))
+            s_push = sum(1 for g in sample if self._spread_push_bool(g))
+            s_loss = sum(1 for g in sample if (not self._cover_bool(g)) and (not self._spread_push_bool(g)))
+            o = sum(1 for g in sample if self._over_bool(g))
+            t_push = sum(1 for g in sample if self._total_push_bool(g))
+            t_under = sum(1 for g in sample if (not self._over_bool(g)) and (not self._total_push_bool(g)))
+            return c, s_loss, s_push, o, t_under, t_push
+
+        def target_errors(sample):
+            c, s_loss, s_push, o, t_under, t_push = counts(sample)
+            decis_spread = c + s_loss
+            decis_total  = o + t_under
+            want_covers  = int(round(p_cover_target * decis_spread)) if decis_spread > 0 else 0
+            want_overs   = int(round(p_over_target  * decis_total )) if decis_total  > 0 else 0
+            err_c = c - want_covers
+            err_o = o - want_overs
+            return err_c, err_o, decis_spread, decis_total, s_push, t_push, want_covers, want_overs
+
+        def inc_sorted_desc():
+            return sorted((g for g in included if id(g) in original_in_ids), key=lambda x: x['rank'], reverse=True)
+
+        def exc_sorted_asc():
+            return sorted((g for g in excluded if id(g) in original_ex_ids), key=lambda x: x['rank'])
+
+        keys_included = set(_teams_and_score_key(g) for g in included)
+
+        err_c, err_o, _, _, _, _, want_c, want_o = target_errors(included)
+        passes = 0
+
+        while passes < max_pass:
+            passes += 1
+            if abs(err_c) <= tol_cover and abs(err_o) <= tol_over:
+                break
+
+            base_cost = (abs(err_c) + abs(err_o), abs(err_c), abs(err_o))
+            best_swap = None
+
+            inc_list = inc_sorted_desc()
+            exc_list = exc_sorted_asc()
+            if not inc_list or not exc_list:
+                break
+
+            def flags(g):
+                return (
+                    self._cover_bool(g),
+                    self._spread_push_bool(g),
+                    self._over_bool(g),
+                    self._total_push_bool(g),
+                )
+
+            def recount_after_swap(g_out, g_in, c_now, s_loss_now, s_push_now, o_now, t_under_now, t_push_now):
+                cov_out, s_push_out, over_out, t_push_out = flags(g_out)
+                c_tmp   = c_now   - (1 if cov_out else 0)
+                o_tmp   = o_now   - (1 if over_out else 0)
+                spsh_tmp = s_push_now - (1 if s_push_out else 0)
+                tpsh_tmp = t_push_now - (1 if t_push_out else 0)
+                slose_tmp = s_loss_now - (1 if ((not cov_out) and (not s_push_out)) else 0)
+                tunder_tmp= t_under_now- (1 if ((not over_out) and (not t_push_out)) else 0)
+
+                cov_in, s_push_in, over_in, t_push_in = flags(g_in)
+                c_new    = c_tmp    + (1 if cov_in else 0)
+                o_new    = o_tmp    + (1 if over_in else 0)
+                spsh_new = spsh_tmp + (1 if s_push_in else 0)
+                tpsh_new = tpsh_tmp + (1 if t_push_in else 0)
+                slose_new= slose_tmp+ (1 if ((not cov_in) and (not s_push_in)) else 0)
+                tunder_new= tunder_tmp+ (1 if ((not over_in) and (not t_push_in)) else 0)
+
+                decis_spread_new = c_new + slose_new
+                decis_total_new  = o_new + tunder_new
+                want_c_new = int(round(p_cover_target * decis_spread_new)) if decis_spread_new > 0 else 0
+                want_o_new = int(round(p_over_target  * decis_total_new )) if decis_total_new  > 0 else 0
+
+                new_err_c = c_new - want_c_new
+                new_err_o = o_new - want_o_new
+                new_cost  = (abs(new_err_c) + abs(new_err_o), abs(new_err_c), abs(new_err_o))
+                return new_err_c, new_err_o, new_cost
+
+            c_now, s_loss_now, s_push_now, o_now, t_under_now, t_push_now = counts(included)
+            for g_out in inc_list:
+                key_out = _teams_and_score_key(g_out)
+                for g_in in exc_list:
+                    key_in = _teams_and_score_key(g_in)
+                    if (key_in in keys_included) and (key_in != key_out):
+                        continue
+                    new_err_c, new_err_o, new_cost = recount_after_swap(
+                        g_out, g_in, c_now, s_loss_now, s_push_now, o_now, t_under_now, t_push_now
+                    )
+                    if new_cost < base_cost:
+                        best_swap = (g_out, g_in, new_err_c, new_err_o, key_out, key_in, new_cost)
+                        base_cost = new_cost
+                        break
+                if best_swap is not None:
+                    break
+
+            if best_swap is None:
+                break
+
+            g_out, g_in, err_c, err_o, key_out, key_in, _ = best_swap
+
+            included.remove(g_out); excluded.append(g_out)
+            excluded.remove(g_in);   included.append(g_in)
+
+            if key_out in keys_included:
+                keys_included.remove(key_out)
+            keys_included.add(key_in)
+
+        final_c, final_sloss, final_spush, final_o, final_tunder, final_tpush = counts(included)
+        decis_spread = final_c + final_sloss
+        decis_total  = final_o + final_tunder
+        want_covers  = int(round(p_cover_target * decis_spread)) if decis_spread > 0 else 0
+        want_overs   = int(round(p_over_target  * decis_total )) if decis_total  > 0 else 0
+
+        print("\n>> Median balancing finished (push-aware)")
+        print(f"   Spread: decisive={decis_spread}  push={final_spush}  desired covers={want_covers}  final covers={final_c}  error={final_c - want_covers:+d}")
+        print(f"   Total : decisive={decis_total}   push={final_tpush}  desired overs ={want_overs}   final overs ={final_o}  error={final_o - want_overs:+d}")
+
+        if not (abs(final_c - want_covers) <= tol_cover and abs(final_o - want_overs) <= tol_over):
+            raise RuntimeError("Exact balancing not achievable via allowed swaps; relax tolerances or N.")
+
+        final_keys = set(_teams_and_score_key(g) for g in included)
+        assert len(included) == len(final_keys), "Duplicate games (team/score) detected after balancing!"
+        return included, excluded
+
+    # ---------- derivatives, counts, EV ----------
+    def _calculate_derivatives(self, final_sample: List[Dict]) -> Dict[str, float]:
+        def nmed(arr): return np.nanmedian(np.array(arr, dtype=float))
+        return {
+            '1H Spread': nmed([g['h1_margin'] for g in final_sample]),
+            '1H Total': nmed([g['h1_total'] for g in final_sample]),
+            '1Q Spread': nmed([g['q1_margin'] for g in final_sample]),
+            '1Q Total': nmed([g['q1_total'] for g in final_sample]),
+            'Home Team Total': nmed([g['home_score'] for g in final_sample]),
+            'Visitor Team Total': nmed([g['visitor_score'] for g in final_sample]),
+        }
+
+    def _count_team_totals(self, sample: List[Dict], tt_home: float, tt_away: float,
+                           tt_home_1h: float, tt_away_1h: float, h1_total_line: float) -> Dict[str, Dict[str, float]]:
+        res = {
+            'full': {
+                'home_over': 0, 'home_under': 0, 'home_push': 0,
+                'away_over': 0, 'away_under': 0, 'away_push': 0,
+                'home_tt_line': tt_home, 'away_tt_line': tt_away
+            },
+            'h1': {
+                'home_over': 0, 'home_under': 0, 'home_push': 0,
+                'away_over': 0, 'away_under': 0, 'away_push': 0,
+                'home_tt_line': tt_home_1h, 'away_tt_line': tt_away_1h,
+                'total_line': h1_total_line
+            },
+            'N': 0
+        }
+
+        for g in sample:
+            if not (isfinite(g['home_score']) and isfinite(g['visitor_score'])):
+                continue
+            res['N'] += 1
+
+            h_grade = _grade_total_value(g['home_score'], tt_home)
+            a_grade = _grade_total_value(g['visitor_score'], tt_away)
+            if h_grade == 'over':  res['full']['home_over'] += 1
+            elif h_grade == 'under': res['full']['home_under'] += 1
+            else: res['full']['home_push'] += 1
+            if a_grade == 'over':  res['full']['away_over'] += 1
+            elif a_grade == 'under': res['full']['away_under'] += 1
+            else: res['full']['away_push'] += 1
+
+            home_1h = safe_sum_or_nan(g['home_q1'], g['home_q2'])
+            away_1h = safe_sum_or_nan(g['visitor_q1'], g['visitor_q2'])
+
+            if isfinite(home_1h):
+                h1_h_grade = _grade_total_value(home_1h, tt_home_1h)
+                if h1_h_grade == 'over':  res['h1']['home_over'] += 1
+                elif h1_h_grade == 'under': res['h1']['home_under'] += 1
+                else: res['h1']['home_push'] += 1
+
+            if isfinite(away_1h):
+                h1_a_grade = _grade_total_value(away_1h, tt_away_1h)
+                if h1_a_grade == 'over':  res['h1']['away_over'] += 1
+                elif h1_a_grade == 'under': res['h1']['away_under'] += 1
+                else: res['h1']['away_push'] += 1
+
+        return res
+
+    def _count_correlated_parlays(
+        self,
+        sample: List[Dict],
+        book_spread_full: float,
+        book_total_full: float,
+        book_spread_1h: float,
+        book_total_1h: float,
+    ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        def init_block():
+            return {
+                'fav_over':  {'win':0, 'loss':0, 'push':0},
+                'fav_under': {'win':0, 'loss':0, 'push':0},
+                'dog_over':  {'win':0, 'loss':0, 'push':0},
+                'dog_under': {'win':0, 'loss':0, 'push':0},
+                'spread_pushes': 0,
+                'total_pushes':  0,
+                'N': 0
+            }
+
+        full_res = init_block()
+        h1_res   = init_block()
+
+        def tally(block, margin, tot, s_line, t_line):
+            block['N'] += 1
+            s_grade = _grade_spread_home_perspective(margin, s_line)
+            t_grade = _grade_total_value(tot, t_line)
+
+            if s_grade == 'push':
+                block['spread_pushes'] += 1
+            if t_grade == 'push':
+                block['total_pushes'] += 1
+
+            home_is_fav = s_line < 0
+            fav_spread_leg = 'win' if (home_is_fav and s_grade=='win') or ((not home_is_fav) and s_grade=='loss') \
+                                 else ('push' if s_grade=='push' else 'loss')
+            dog_spread_leg = 'win' if (home_is_fav and s_grade=='loss') or ((not home_is_fav) and s_grade=='win') \
+                                 else ('push' if s_grade=='push' else 'loss')
+
+            over_leg  = 'win' if t_grade=='over'  else ('push' if t_grade=='push' else 'loss')
+            under_leg = 'win' if t_grade=='under' else ('push' if t_grade=='push' else 'loss')
+
+            block['fav_over'][ _parlay_grade(fav_spread_leg, over_leg) ]  += 1
+            block['fav_under'][ _parlay_grade(fav_spread_leg, under_leg) ] += 1
+            block['dog_over'][ _parlay_grade(dog_spread_leg, over_leg) ]  += 1
+            block['dog_under'][ _parlay_grade(dog_spread_leg, under_leg) ] += 1
+
+        for g in sample:
+            if not (isfinite(g['final_margin']) and isfinite(g['final_total'])):
+                continue
+            tally(full_res, g['final_margin'], g['final_total'], book_spread_full, book_total_full)
+
+            if isfinite(g['h1_margin']) and isfinite(g['h1_total']):
+                tally(h1_res, g['h1_margin'], g['h1_total'], book_spread_1h, book_total_1h)
+
+        return full_res, h1_res
+
+    @staticmethod
+    def _parlay_odds_from_counts(counts: Dict[str,int]) -> Tuple[Optional[int], Optional[int], Dict[str,float]]:
+        w = counts.get('win',0); l = counts.get('loss',0); p = counts.get('push',0)
+        n = w + l + p
+        if n == 0:
+            return None, None, {'win':0.0, 'loss':0.0, 'push':0.0}
+        r_win = w / n; r_loss = l / n; r_push = p / n
+        ex_push_prob = (w / (w + l)) if (w + l) > 0 else None
+        odds_ex_push = _prob_to_american(ex_push_prob) if ex_push_prob is not None else None
+        push_as_loss_prob = w / n
+        odds_push_loss = _prob_to_american(push_as_loss_prob)
+        return odds_ex_push, odds_push_loss, {'win':r_win, 'loss':r_loss, 'push':r_push}
+
+    def _print_correlated(self, label: str, block: Dict[str, Dict[str, int]]) -> None:
+        def fairline(totals: Dict[str, int]) -> Tuple[str, str, Dict[str, float]]:
+            ex, pl, probs = self._parlay_odds_from_counts(totals)
+            ex_str = f"{ex:+d}" if ex is not None else "N/A"
+            pl_str = f"{pl:+d}" if pl is not None else "N/A"
+            return ex_str, pl_str, probs
+
+        print(f"\n=== Correlated Parlays: {label} ===")
+        N  = block.get("N", 0)
+        sP  = block.get("spread_pushes", 0)
+        tP  = block.get("total_pushes", 0)
+        if N:
+            print(f"Sample size: {N}   spread_push_rate={sP}/{N}={sP/N:.2%}   total_push_rate={tP}/{N}={tP/N:.2%}")
+
+        for key in ["fav_over", "fav_under", "dog_over", "dog_under"]:
+            counts = block.get(key, {"win":0, "loss":0, "push":0})
+            w = counts.get("win", 0); l = counts.get("loss", 0); p = counts.get("push", 0)
+            n = w + l + p
+            ex_str, pl_str, probs = fairline(counts)
+            label_nice = key.replace("_", " ").title()
+            print(
+                f"{label_nice:<12} | n={n:>3}  W/L/P={w}/{l}/{p}  "
+                f"| fair ex-push={ex_str:>5}  fair push=loss={pl_str:>5}  "
+                f"| rates W/L/P={probs['win']:.2%}/{probs['loss']:.2%}/{probs['push']:.2%}"
+            )
+
+    # ---------- EV helpers/prints ----------
+    def _count_line_probs(self, values: List[float], line: float, is_spread: bool) -> Tuple[float, float, float]:
+        w = l = p = 0
+        for val in values:
+            if not isfinite(val):
+                continue
+            if is_spread:
+                g = _grade_spread_home_perspective(val, line)
+                if g == 'win': w += 1
+                elif g == 'loss': l += 1
+                else: p += 1
+            else:
+                g = _grade_total_value(val, line)
+                if g == 'over': w += 1
+                elif g == 'under': l += 1
+                else: p += 1
+        n = w + l + p
+        if n == 0:
+            return 0.0, 0.0, 0.0
+        return w / n, l / n, p / n
+
+    def _count_ml_probs(self, margins: List[float]) -> Tuple[float, float, float]:
+        h = a = t = 0
+        for m in margins:
+            if not isfinite(m):
+                continue
+            if abs(m) <= EPS:
+                t += 1
+            elif m > 0:
+                h += 1
+            else:
+                a += 1
+        n = h + a + t
+        if n == 0:
+            return 0.0, 0.0, 0.0
+        return h / n, a / n, t / n
+
+    def _print_ev_report_spread_total(self, label: str,
+                                      spread_line: Optional[float], spread_odds_home: Optional[float], spread_odds_away: Optional[float],
+                                      total_line: Optional[float], total_odds_over: Optional[float], total_odds_under: Optional[float],
+                                      margins: List[float], totals: List[float]) -> None:
+        print(f"\n=== EV Report: {label} ===")
+
+        if spread_line is not None and spread_odds_home is not None and spread_odds_away is not None:
+            pW_home, pL_home, pP_home = self._count_line_probs(margins, spread_line, is_spread=True)
+            pW_away, pL_away, pP_away = pL_home, pW_home, pP_home
+
+            ev_home = _ev_from_probs_and_odds(pW_home, pL_home, pP_home, spread_odds_home)
+            ev_away = _ev_from_probs_and_odds(pW_away, pL_away, pP_away, spread_odds_away)
+
+            def fair_strings(pw, pl):
+                ex = _prob_to_american(pw/(pw+pl)) if (pw+pl) > 0 else None
+                ploss = _prob_to_american(pw)       # counting pushes as losses
+                ex_str = f"{ex:+d}" if ex is not None else "N/A"
+                pl_str = f"{ploss:+d}" if ploss is not None else "N/A"
+                return ex_str, pl_str
+
+            exH, plH = fair_strings(pW_home, pL_home)
+            exA, plA = fair_strings(pW_away, pL_away)
+
+            def mark(ev): return " (+EV)" if (ev is not None and ev > 0) else ""
+            print(f"Spread line: {spread_line:+.2f}")
+            print(f"  HOME side (odds {int(spread_odds_home):+d}):  pW={pW_home:.2%}  pL={pL_home:.2%}  pPush={pP_home:.2%}  EV/1u={ev_home:+.4f}{mark(ev_home)}  fair(ex-push)={exH}  fair(push=loss)={plH}")
+            print(f"  AWAY side (odds {int(spread_odds_away):+d}):  pW={pW_away:.2%}  pL={pL_away:.2%}  pPush={pP_away:.2%}  EV/1u={ev_away:+.4f}{mark(ev_away)}  fair(ex-push)]={exA}  fair(push=loss)={plA}")
+        else:
+            print("  (No spread EV calculated; missing line or odds)")
+
+        if total_line is not None and total_odds_over is not None and total_odds_under is not None:
+            pW_over, pL_over, pP_over = self._count_line_probs(totals, total_line, is_spread=False)
+            pW_under, pL_under, pP_under = pL_over, pW_over, pP_over
+
+            ev_over  = _ev_from_probs_and_odds(pW_over,  pL_over,  pP_over,  total_odds_over)
+            ev_under = _ev_from_probs_and_odds(pW_under, pL_under, pP_under, total_odds_under)
+
+            def fair_strings(pw, pl):
+                ex = _prob_to_american(pw/(pw+pl)) if (pw+pl) > 0 else None
+                ploss = _prob_to_american(pw)
+                ex_str = f"{ex:+d}" if ex is not None else "N/A"
+                pl_str = f"{ploss:+d}" if ploss is not None else "N/A"
+                return ex_str, pl_str
+
+            exO, plO = fair_strings(pW_over, pL_over)
+            exU, plU = fair_strings(pW_under, pL_under)
+
+            def mark(ev): return " (+EV)" if (ev is not None and ev > 0) else ""
+            print(f"Total line: {total_line:.2f}")
+            print(f"  OVER  (odds {int(total_odds_over):+d}):  pW={pW_over:.2%}  pL={pL_over:.2%}  pPush={pP_over:.2%}  EV/1u={ev_over:+.4f}{mark(ev_over)}  fair(ex-push)={exO}  fair(push=loss)={plO}")
+            print(f"  UNDER (odds {int(total_odds_under):+d}): pW={pW_under:.2%} pL={pL_under:.2%} pPush={pP_under:.2%} EV/1u={ev_under:+.4f}{mark(ev_under)}  fair(ex-push)={exU}  fair(push=loss)={plU}")
+        else:
+            print("  (No total EV calculated; missing line or odds)")
+
+    def _print_ev_report_moneyline(self, label: str, ml_home_odds: Optional[float], ml_away_odds: Optional[float], margins: List[float]) -> None:
+        print(f"\n=== Moneyline EV Report: {label} ===")
+        if ml_home_odds is None or ml_away_odds is None:
+            print("  (No ML EV calculated; missing odds)")
+            return
+
+        pH, pA, pT = self._count_ml_probs(margins)  # tie = push
+        ev_home = _ev_from_probs_and_odds(pH, pA, pT, ml_home_odds)
+        ev_away = _ev_from_probs_and_odds(pA, pH, pT, ml_away_odds)
+
+        def mark(ev): return " (+EV)" if (ev is not None and ev > 0) else ""
+        def fair_strings(pw, pl):
+            ex = _prob_to_american(pw/(pw+pl)) if (pw+pl) > 0 else None
+            ploss = _prob_to_american(pw)
+            ex_str = f"{ex:+d}" if ex is not None else "N/A"
+            pl_str = f"{ploss:+d}" if ploss is not None else "N/A"
+            return ex_str, pl_str
+
+        exH, plH = fair_strings(pH, pA)
+        exA, plA = fair_strings(pA, pH)
+
+        print(f"  HOME ML: odds={int(ml_home_odds):+d}  pWin={pH:.2%}  pLoss={pA:.2%}  pPush(Tie)={pT:.2%}  EV/1u={ev_home:+.4f}{mark(ev_home)}  fair(ex-push)={exH}  fair(push=loss)={plH}")
+        print(f"  AWAY ML: odds={int(ml_away_odds):+d}  pWin={pA:.2%}  pLoss={pH:.2%}  pPush(Tie)={pT:.2%}  EV/1u={ev_away:+.4f}{mark(ev_away)}  fair(ex-push)={exA}  fair(push=loss)={plA}")
+
+    def _print_initial_push_snapshot(self, sample: List[Dict]):
+        s_push = sum(1 for g in sample if self._spread_push_bool(g))
+        t_push = sum(1 for g in sample if self._total_push_bool(g))
+        N = len(sample)
+        print("\n--- Initial Sample: parent-line pushes snapshot ---")
+        print(f"spread_push_rate = {s_push}/{N} = {s_push/N*100:.2f}%")
+        print(f"total_push_rate  = {t_push}/{N} = {t_push/N*100:.2f}%")
+
+    def _print_results(self, sample: List[Dict], derivatives: Dict[str, float]):
+        stats = {
+            'size': len(sample),
+            'mean_spread': np.mean([g['spread'] for g in sample]),
+            'mean_total': np.mean([g['total'] for g in sample]),
+            'home_cover_pct': np.mean([self._cover_bool(g) for g in sample if not self._spread_push_bool(g)]),
+            'over_pct': np.mean([self._over_bool(g) for g in sample if not self._total_push_bool(g)]),
+            'spread_push_pct': np.mean([self._spread_push_bool(g) for g in sample]),
+            'total_push_pct': np.mean([self._total_push_bool(g) for g in sample]),
+        }
+        print("\n" + "="*76)
+        print("📈 Analysis Results 📈".center(76))
+        print("="*76)
+        print("\n--- Final Sample Stats ---")
+        print(f"{'size':<15} {stats['size']:.2f}")
+        print(f"{'mean_spread':<15} {stats['mean_spread']:.2f}")
+        print(f"{'mean_total':<15} {stats['mean_total']:.2f}")
+        print(f"{'home_cover_pct':<15} {stats['home_cover_pct']:.2%}")
+        print(f"{'over_pct':<15} {stats['over_pct']:.2%}")
+        print(f"{'spread_push_pct':<15} {stats['spread_push_pct']:.2%}")
+        print(f"{'total_push_pct':<15} {stats['total_push_pct']:.2%}")
+        print("\n--- Derivative Market Projections ---")
+        for k, v in derivatives.items():
+            print(f"{k:<20} {v:+.2f}" if "Spread" in k else f"{k:<20} {v:.2f}")
+        print("="*76 + "\n")
+
+    # ========================= PUBLIC RUN =========================
+    def run_analysis(
+        self,
+        target_spread: float,
+        target_total: float,
+        sample_size: int = 500,
+        book_spread_full: Optional[float] = None,
+        book_total_full: Optional[float] = None,
+        book_spread_1h: Optional[float] = None,
+        book_total_1h: Optional[float] = None,
+        book_spread_1q: Optional[float] = None,
+        book_total_1q: Optional[float] = None,
+        team_totals_full: Optional[Tuple[float, float]] = None,
+        team_totals_1h: Optional[Tuple[float, float]] = None,
+        ev_1h_spread_odds_home: Optional[float] = None,
+        ev_1h_spread_odds_away: Optional[float] = None,
+        ev_1h_total_odds_over: Optional[float] = None,
+        ev_1h_total_odds_under: Optional[float] = None,
+        ev_1q_spread_odds_home: Optional[float] = None,
+        ev_1q_spread_odds_away: Optional[float] = None,
+        ev_1q_total_odds_over: Optional[float] = None,
+        ev_1q_total_odds_under: Optional[float] = None,
+        ev_1h_ml_home_odds: Optional[float] = None,
+        ev_1h_ml_away_odds: Optional[float] = None,
+        ev_1q_ml_home_odds: Optional[float] = None,
+        ev_1q_ml_away_odds: Optional[float] = None,
+    ):
+        print("\n" + "="*76)
+        print("🚀 Starting Answer Key Analysis 🚀".center(76))
+        print(f"Target Line (for indexing): Spread={target_spread:+.1f}, Total={target_total:.1f}".center(76))
+        print("="*76)
+
+        self.target_spread, self.target_total = target_spread, target_total
+
+        # Step 2: align means by adjusting indexing target; pushes allowed in sample
+        N = sample_size if sample_size % 2 == 0 else sample_size - 1
+        adj_s, adj_t, included, excluded = self._align_means(N, target_spread, target_total)
+
+        # Save initial sample snapshot for provenance + push snapshot
+        pd.DataFrame(included).to_csv("initial_sample_topN.csv", index=False)
+        self._print_initial_push_snapshot(included)
+
+        # Step 3: EXACT median-result balancing on decisive-only counts (push-aware)
+        included, excluded = self._balance_medians_exact(included, excluded)
+
+        # Final sample
+        final_sample = included
+        pd.DataFrame(final_sample).to_csv("final_sample.csv", index=False)
+        print("\n✓ Final sample (pushes allowed) saved to 'final_sample.csv'")
+
+        # Derivatives
+        derivatives = self._calculate_derivatives(final_sample)
+        self._print_results(final_sample, derivatives)
+
+        # Correlated parlays via BOOK lines
+        if book_spread_full is None: book_spread_full = target_spread
+        if book_total_full  is None: book_total_full  = target_total
+        if book_spread_1h   is None: book_spread_1h   = book_spread_full / 2.0
+        if book_total_1h    is None: book_total_1h    = book_total_full  / 2.0
+
+        full_counts, h1_counts = self._count_correlated_parlays(
+            final_sample,
+            book_spread_full, book_total_full,
+            book_spread_1h,   book_total_1h
+        )
+
+        # Print correlated results
+        self._print_correlated("Full Game", full_counts)
+        self._print_correlated("1H", h1_counts)
+
+        # Team totals (optional)
+        if team_totals_full is None:
+            home_tt = (book_total_full - book_spread_full) / 2.0
+            away_tt = book_total_full - home_tt
+        else:
+            home_tt, away_tt = team_totals_full
+
+        if team_totals_1h is None:
+            home_tt_1h = (book_total_1h - book_spread_1h) / 2.0
+            away_tt_1h = book_total_1h - home_tt_1h
+        else:
+            home_tt_1h, away_tt_1h = team_totals_1h
+
+        tt_counts = self._count_team_totals(final_sample, home_tt, away_tt, home_tt_1h, away_tt_1h, book_total_1h)
+
+        def pct(x, n): return (x / n * 100.0) if n else 0.0
+        Ntt = tt_counts['N']
+
+        print("\n--- Team Totals (Full Game) by counting (win/loss/push rates) ---")
+        print(f"home_tt_line         {tt_counts['full']['home_tt_line']:.2f}")
+        print(f"away_tt_line         {tt_counts['full']['away_tt_line']:.2f}")
+        print(f"home_over            {pct(tt_counts['full']['home_over'], Ntt):.2f}%")
+        print(f"home_under           {pct(tt_counts['full']['home_under'], Ntt):.2f}%")
+        print(f"home_push            {pct(tt_counts['full']['home_push'], Ntt):.2f}%")
+        print(f"away_over            {pct(tt_counts['full']['away_over'], Ntt):.2f}%")
+        print(f"away_under           {pct(tt_counts['full']['away_under'], Ntt):.2f}%")
+        print(f"away_push            {pct(tt_counts['full']['away_push'], Ntt):.2f}%")
+
+        print("\n--- Team Totals (1H) by counting (win/loss/push rates) ---")
+        print(f"home_tt_line         {tt_counts['h1']['home_tt_line']:.2f}")
+        print(f"away_tt_line         {tt_counts['h1']['away_tt_line']:.2f}")
+        print(f"total_line(1H)       {tt_counts['h1']['total_line']:.2f}")
+        print(f"home_over            {pct(tt_counts['h1']['home_over'], Ntt):.2f}%")
+        print(f"home_under           {pct(tt_counts['h1']['home_under'], Ntt):.2f}%")
+        print(f"home_push            {pct(tt_counts['h1']['home_push'], Ntt):.2f}%")
+        print(f"away_over            {pct(tt_counts['h1']['away_over'], Ntt):.2f}%")
+        print(f"away_under           {pct(tt_counts['h1']['away_under'], Ntt):.2f}%")
+        print(f"away_push            {pct(tt_counts['h1']['away_push'], Ntt):.2f}%")
+
+        # ===== EV (1H & 1Q) =====
+        h1_margins = [g['h1_margin'] for g in final_sample if isfinite(g['h1_margin'])]
+        h1_totals  = [g['h1_total']  for g in final_sample if isfinite(g['h1_total'])]
+        q1_margins = [g['q1_margin'] for g in final_sample if isfinite(g['q1_margin'])]
+        q1_totals  = [g['q1_total']  for g in final_sample if isfinite(g['q1_total'])]
+
+        if book_spread_1q is None: book_spread_1q = (book_spread_full / 4.0)
+        if book_total_1q  is None: book_total_1q  = (book_total_full  / 4.0)
+
+        self._print_ev_report_spread_total(
+            "1H",
+            spread_line=book_spread_1h,
+            spread_odds_home=ev_1h_spread_odds_home,
+            spread_odds_away=ev_1h_spread_odds_away,
+            total_line=book_total_1h,
+            total_odds_over=ev_1h_total_odds_over,
+            total_odds_under=ev_1h_total_odds_under,
+            margins=h1_margins,
+            totals=h1_totals
+        )
+        self._print_ev_report_moneyline(
+            "1H",
+            ml_home_odds=ev_1h_ml_home_odds,
+            ml_away_odds=ev_1h_ml_home_odds if ev_1h_ml_away_odds is None else ev_1h_ml_away_odds,
+            margins=h1_margins
+        )
+
+        self._print_ev_report_spread_total(
+            "1Q",
+            spread_line=book_spread_1q,
+            spread_odds_home=ev_1q_spread_odds_home,
+            spread_odds_away=ev_1q_spread_odds_away,
+            total_line=book_total_1q,
+            total_odds_over=ev_1q_total_odds_over,
+            total_odds_under=ev_1q_total_odds_under,
+            margins=q1_margins,
+            totals=q1_totals
+        )
+        self._print_ev_report_moneyline(
+            "1Q",
+            ml_home_odds=ev_1q_ml_home_odds,
+            ml_away_odds=ev_1q_ml_home_odds if ev_1q_ml_away_odds is None else ev_1q_ml_away_odds,
+            margins=q1_margins
+        )
+
+        pd.DataFrame([{
+            'book_spread_full': book_spread_full,
+            'book_total_full':  book_total_full,
+            'book_spread_1h':   book_spread_1h,
+            'book_total_1h':    book_total_1h,
+            'book_spread_1q':   book_spread_1q,
+            'book_total_1q':    book_total_1q
+        }]).to_csv("book_lines_used.csv", index=False)
+
+
+def main():
+    # Resolve parent target spread sign from CONFIG
+    t_spread = float(CONFIG["TARGET"]["spread"])
+    t_total  = float(CONFIG["TARGET"]["total"])
+    fav_side = str(CONFIG["TARGET"]["favorite"]).strip().lower()
+    if fav_side not in ("home", "away"):
+        raise ValueError("CONFIG.TARGET.favorite must be 'home' or 'away'")
+    target_spread = -abs(t_spread) if fav_side == "home" else abs(t_spread)
+
+    # Resolve BOOK lines
+    B = CONFIG["BOOK"]
+    full_spread = B["full"]["spread"] if B["full"]["spread"] is not None else target_spread
+    full_total  = B["full"]["total"]  if B["full"]["total"]  is not None else t_total
+
+    h1_spread = B["1H"]["spread"] if B["1H"]["spread"] is not None else (full_spread / 2.0)
+    h1_total  = B["1H"]["total"]  if B["1H"]["total"]  is not None else (full_total  / 2.0)
+
+    q1_spread = B["1Q"]["spread"] if B["1Q"]["spread"] is not None else (full_spread / 4.0)
+    q1_total  = B["1Q"]["total"]  if B["1Q"]["total"]  is not None else (full_total  / 4.0)
+
+    # Team totals (defaults if None) using BOOK lines
+    TT = CONFIG["TEAM_TOTALS"]
+    if TT["full"]["home"] is None or TT["full"]["away"] is None:
+        home_tt = (full_total - full_spread) / 2.0
+        away_tt = full_total - home_tt
+    else:
+        home_tt = float(TT["full"]["home"])
+        away_tt = float(TT["full"]["away"])
+
+    if TT["1H"]["home"] is None or TT["1H"]["away"] is None:
+        home_tt_1h = (h1_total - h1_spread) / 2.0
+        away_tt_1h = h1_total - home_tt_1h
+    else:
+        home_tt_1h = float(TT["1H"]["home"])
+        away_tt_1h = float(TT["1H"]["away"])
+
+    # EV odds (side-specific)
+    EV = CONFIG["EV"]
+    ev_1h_spread_odds_home = EV["1H"]["spread_odds"]["home"]
+    ev_1h_spread_odds_away = EV["1H"]["spread_odds"]["away"]
+    ev_1h_total_odds_over  = EV["1H"]["total_odds"]["over"]
+    ev_1h_total_odds_under = EV["1H"]["total_odds"]["under"]
+    ev_1q_spread_odds_home = EV["1Q"]["spread_odds"]["home"]
+    ev_1q_spread_odds_away = EV["1Q"]["spread_odds"]["away"]
+    ev_1q_total_odds_over  = EV["1Q"]["total_odds"]["over"]
+    ev_1q_total_odds_under = EV["1Q"]["total_odds"]["under"]
+    ev_1h_ml_home_odds     = EV["1H"]["ml_home_odds"]
+    ev_1h_ml_away_odds     = EV["1H"]["ml_away_odds"]
+    ev_1q_ml_home_odds     = EV["1Q"]["ml_home_odds"]
+    ev_1q_ml_away_odds     = EV["1Q"]["ml_away_odds"]
+
+    # Enforce even N
+    N = int(CONFIG["SAMPLE_SIZE"])
+    if N % 2 == 1:
+        N -= 1
+
+    algo = AnswerKeyAlgorithm(CONFIG["DATA_PATH"])
+    algo.run_analysis(
+        target_spread=target_spread,
+        target_total=t_total,
+        sample_size=N,
+        book_spread_full=full_spread,
+        book_total_full=full_total,
+        book_spread_1h=h1_spread,
+        book_total_1h=h1_total,
+        book_spread_1q=q1_spread,
+        book_total_1q=q1_total,
+        team_totals_full=(home_tt, away_tt),
+        team_totals_1h=(home_tt_1h, away_tt_1h),
+        ev_1h_spread_odds_home=ev_1h_spread_odds_home,
+        ev_1h_spread_odds_away=ev_1h_spread_odds_away,
+        ev_1h_total_odds_over=ev_1h_total_odds_over,
+        ev_1h_total_odds_under=ev_1h_total_odds_under,
+        ev_1q_spread_odds_home=ev_1q_spread_odds_home,
+        ev_1q_spread_odds_away=ev_1q_spread_odds_away,
+        ev_1q_total_odds_over=ev_1q_total_odds_over,
+        ev_1q_total_odds_under=ev_1q_total_odds_under,
+        ev_1h_ml_home_odds=ev_1h_ml_home_odds,
+        ev_1h_ml_away_odds=ev_1h_ml_away_odds,
+        ev_1q_ml_home_odds=ev_1q_ml_home_odds,
+        ev_1q_ml_away_odds=ev_1q_ml_away_odds,
+    )
+
+
+if __name__ == "__main__":
+    main()
